@@ -9,7 +9,8 @@
   canvas { display: block; }
   #bar { position: fixed; top: 8px; left: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
          background: #000a; padding: 6px 10px; border-radius: 6px; }
-  #bar button, #bar label { color: inherit; background: #333; border: 0; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
+  body.busy #bar button { pointer-events: none; opacity: .5; }
+  #bar button, #bar label, #bar select { color: inherit; background: #333; border: 0; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
   #hint { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; font-size: 20px; opacity: .6; }
   #hint[hidden] { display: none; }
   body.dragging #hint, body.dragging #hint[hidden] { display: flex; opacity: 1; background: #3a6ea533; }
@@ -24,6 +25,12 @@
   <span>Point size <input id="size" type="range" min="0.5" max="10" step="0.5" value="2"></span>
   <button id="zup">Z-up</button>
   <button id="fit">Fit</button>
+  <button id="align" title="Find each cloud's position automatically">Auto-align</button>
+  <select id="move" title="Pick a cloud to place by hand"><option value="">Move…</option></select>
+  <button id="rotate" title="Toggle the gizmo between translate and rotate">Translate</button>
+  <button id="refine" title="Fine-tune from the current placement">Refine</button>
+  <label><input id="tint" type="checkbox"> Color by file</label>
+  <button id="save">Save merged</button>
   <span id="info"></span>
 </div>
 <div id="hint">Drop .ply files here</div>

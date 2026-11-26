@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/OrbitControls.js';
 import { PLYLoader } from 'three/addons/PLYLoader.js';
+import { PLYExporter } from 'three/addons/PLYExporter.js';
+import { TransformControls } from 'three/addons/TransformControls.js';
 
 const $ = id => document.getElementById(id);
 
@@ -18,6 +20,12 @@ controls.enableDamping = true;
 
 const root = new THREE.Group();  // rotated for Z-up files
 scene.add(root);
+
+// Gizmo for placing a cloud by hand before "Refine". World space, so rotation is about the view's up.
+const gizmo = new TransformControls(camera, renderer.domElement);
+gizmo.space = 'world';
+gizmo.addEventListener('dragging-changed', e => { controls.enabled = !e.value; });
+scene.add(gizmo);
 let pointSize = 2;
 
 const resize = () => {
@@ -85,6 +93,7 @@ async function loadFiles(files) {
     files = [...files].filter(f => /\.ply$/i.test(f.name));
     if (!files.length) return;
     $('info').textContent = 'Loading…';
+    gizmo.detach();
     root.clear();
     let points = 0;
     for (const f of files) {
@@ -97,10 +106,19 @@ async function loadFiles(files) {
             alert(`${f.name}: ${e.message}`);
         }
     }
-    // Center everything on the combined bounds (keeps float32 precision for big coordinates).
-    const box = new THREE.Box3().setFromObject(root);
-    const center = box.getCenter(new THREE.Vector3());
-    for (const o of root.children) o.geometry.translate(-center.x, -center.y, -center.z);
+    // Center everything on the combined bounds (keeps float32 precision for big coordinates),
+    // then put each cloud's origin at its own center so the gizmo rotates it in place.
+    const center = new THREE.Box3().setFromObject(root).getCenter(new THREE.Vector3());
+    for (const o of root.children) {
+        o.geometry.translate(-center.x, -center.y, -center.z);
+        o.geometry.computeBoundingBox();
+        const own = o.geometry.boundingBox.getCenter(new THREE.Vector3());
+        o.geometry.translate(-own.x, -own.y, -own.z);
+        o.position.copy(own);
+    }
+    $('move').innerHTML = '<option value="">Move…</option>' +
+        root.children.map((o, i) => `<option value="${i}">${o.name.replace(/</g, '&lt;')}</option>`).join('');
+    tint($('tint').checked);
     $('info').textContent = `${root.children.length} file(s), ${points.toLocaleString()} points`;
     fit();
 }
@@ -115,11 +133,109 @@ function fit() {
     camera.updateProjectionMatrix();
 }
 
+// ── Alignment ──────────────────────────────────────────
+
+const worker = new Worker('./align-worker.js', { type: 'module' });
+const runWorker = msg => new Promise((resolve, reject) => {
+    worker.onmessage = e => (e.data.error ? reject(new Error(e.data.error)) : resolve(e.data));
+    worker.postMessage(msg, [msg.target.buffer, msg.source.buffer]);
+});
+
+// Cloud's points in root space (its current placement), at most `max` of them.
+function cloudPoints(objs, max = 300000) {
+    const total = objs.reduce((n, o) => n + o.geometry.attributes.position.count, 0);
+    const step = Math.max(1, Math.ceil(total / max)), out = [], v = new THREE.Vector3();
+    for (const o of objs) {
+        o.updateMatrix();
+        const pos = o.geometry.attributes.position;
+        for (let i = 0; i < pos.count; i += step) {
+            v.fromBufferAttribute(pos, i).applyMatrix4(o.matrix);
+            out.push(v.x, v.y, v.z);
+        }
+    }
+    return Float32Array.from(out);
+}
+
+// 'align': search all rotations. 'refine': only near where each cloud is now.
+// Each cloud is aligned to everything before it; with one picked under "Move", just that one.
+async function runAlign(mode) {
+    const objs = root.children;
+    if (objs.length < 2) return void ($('info').textContent = 'Load 2+ files to align');
+    const picked = objs[$('move').value];
+    const jobs = picked && mode === 'refine'
+        ? [[picked, objs.filter(o => o !== picked)]]
+        : objs.slice(1).map((o, i) => [o, objs.slice(0, i + 1)]);
+    const report = [];
+    document.body.classList.add('busy');
+    try {
+        for (const [i, [obj, targets]] of jobs.entries()) {
+            $('info').textContent = `Aligning ${obj.name} (${i + 1}/${jobs.length})…`;
+            const r = await runWorker({
+                mode, up: root.rotation.x ? 2 : 1, target: cloudPoints(targets), source: cloudPoints([obj]),
+            });
+            obj.updateMatrix();
+            obj.matrix.premultiply(new THREE.Matrix4().set(...r.matrix));
+            obj.matrix.decompose(obj.position, obj.quaternion, obj.scale);
+            report.push(`${obj.name}: ${Math.round(r.fitness * 100)}% overlap${r.fitness < 0.15 ? ' ⚠' : ''}`);
+        }
+        $('info').textContent = report.join(' · ');
+        if (report.some(s => s.endsWith('⚠'))) {
+            $('info').textContent += ' — ⚠ may be wrong: place it roughly with Move, then Refine';
+        }
+    } catch (e) {
+        $('info').textContent = `Align failed: ${e.message}`;
+    } finally {
+        document.body.classList.remove('busy');
+    }
+}
+
+// Solid color per file, to judge how well clouds line up.
+function tint(on) {
+    root.children.forEach((o, i) => {
+        const m = o.material;
+        m.userData.orig ??= { vc: m.vertexColors, color: m.color.getHex() };
+        m.vertexColors = on ? false : m.userData.orig.vc;
+        if (on) m.color.setHSL((i * 0.618) % 1, 0.8, 0.55); else m.color.setHex(m.userData.orig.color);
+        m.needsUpdate = true;
+    });
+}
+
+function saveMerged() {
+    if (!root.children.length) return;
+    // Export in the files' own frame, not the Z-up display rotation.
+    const rx = root.rotation.x;
+    root.rotation.x = 0;
+    root.updateMatrixWorld(true);
+    new PLYExporter().parse(root, data => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([data]));
+        a.download = 'merged.ply';
+        a.click();
+        URL.revokeObjectURL(a.href);
+    }, { binary: true });
+    root.rotation.x = rx;
+    root.updateMatrixWorld(true);
+}
+
 // ── UI ─────────────────────────────────────────────────
 
 $('file').onchange = e => loadFiles(e.target.files);
 $('fit').onclick = fit;
 $('zup').onclick = () => { root.rotation.x = root.rotation.x ? 0 : -Math.PI / 2; fit(); };
+$('align').onclick = () => runAlign('align');
+$('refine').onclick = () => runAlign('refine');
+$('tint').onchange = e => tint(e.target.checked);
+$('save').onclick = saveMerged;
+$('move').onchange = e => {
+    const o = root.children[e.target.value];
+    o ? gizmo.attach(o) : gizmo.detach();
+};
+$('rotate').onclick = e => {
+    const rotate = gizmo.mode === 'translate';
+    gizmo.setMode(rotate ? 'rotate' : 'translate');
+    gizmo.showX = gizmo.showZ = !rotate;  // rotate only about the vertical axis
+    e.target.textContent = rotate ? 'Rotate' : 'Translate';
+};
 $('size').oninput = e => {
     pointSize = +e.target.value;
     root.traverse(o => { if (o.isPoints) o.material.size = pointSize; });
